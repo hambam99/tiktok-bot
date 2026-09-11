@@ -17,6 +17,7 @@ def home():
 # Credentials
 BOT_TOKEN = '8735644612:AAEhuQSjH0f9pxlUA5Lgl8Bv9fOxpB1Rh3k'
 RAPIDAPI_KEY = 'YOUR_RAPIDAPI_KEY'  # Ensure your valid RapidAPI Key is pasted here
+RAPIDAPI_KEY = '345f1277afmsh8ecaec81b86c0e9p1fa406jsne5cb618427ac'
 
 def clean_input(text: str) -> str:
     return text.strip().lstrip('@').lower()
