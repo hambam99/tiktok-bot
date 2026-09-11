@@ -59,35 +59,30 @@ def build_short_candidates(base_word: str) -> list[str]:
 
     valid_list = [c for c in candidates if 3 <= len(c) <= 24 and not c.endswith('.') and not c.startswith('.')]
     valid_list.sort(key=lambda x: (len(x), x))
-    return valid_list[:3]  # Keep batch tiny to avoid web blocks
+    return valid_list[:3]
 
 async def check_single_username(client: httpx.AsyncClient, username: str) -> tuple[str, bool]:
     if len(username) < 2:
         return username, False
     
-    url = f'https://www.tiktok.com/api/user/detail/?uniqueId={username}'
+    # Query TikTok's public oEmbed API endpoint
+    url = f'https://www.tiktok.com/oembed?url=https://www.tiktok.com/@{username}'
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.tiktok.com/'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json'
     }
     try:
         res = await client.get(url, headers=headers)
-        logging.info(f"Checking @{username} -> TikTok Web Code: {res.status_code}")
+        logging.info(f"Checking @{username} via oEmbed -> Status Code: {res.status_code}")
         
         if res.status_code == 200:
-            data = res.json()
-            # If user object exists and has user info, handle is TAKEN
-            userInfo = data.get('userInfo', {})
-            if userInfo and 'user' in userInfo:
-                return username, False
-            # Otherwise (user not found code or empty userInfo), AVAILABLE
-            return username, True
-        elif res.status_code == 404:
+            # 200 OK means TikTok found valid user embed data -> Handle is TAKEN
+            return username, False
+        elif res.status_code in (400, 404):
+            # 400/404 means user profile does not exist -> Handle is AVAILABLE
             return username, True
         else:
-            logging.warning(f"Unexpected status {res.status_code} for @{username}")
+            logging.warning(f"Unexpected oEmbed status {res.status_code} for @{username}")
             return username, False
     except Exception as e:
         logging.error(f"Error checking @{username}: {e}")
@@ -108,7 +103,7 @@ async def short_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uname, is_free = await check_single_username(client, cand)
             if is_free:
                 available.append(uname)
-            await asyncio.sleep(1.5)  # Throttling delay
+            await asyncio.sleep(1.5)  # Delay between checks to respect rate limits
         
     if available:
         available.sort(key=len)
@@ -138,7 +133,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for target in targets:
             res = await check_single_username(client, target)
             results.append(res)
-            await asyncio.sleep(1.5)  # Throttling delay
+            await asyncio.sleep(1.5)  # Delay between checks
     
     available_matches = [uname for uname, is_free in results if is_free]
     exact_free = user_input in available_matches
