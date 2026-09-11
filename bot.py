@@ -7,7 +7,7 @@ from telegram.request import HTTPXRequest
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Web server setup to satisfy Render Web Service health check
+# 1. Flask App Setup for Render Port Binding
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -16,7 +16,6 @@ def home():
 
 # Credentials
 BOT_TOKEN = '8735644612:AAEhuQSjH0f9pxlUA5Lgl8Bv9fOxpB1Rh3k'
-RAPIDAPI_KEY = 'YOUR_RAPIDAPI_KEY'  # Ensure your valid RapidAPI Key is pasted here
 RAPIDAPI_KEY = '345f1277afmsh8ecaec81b86c0e9p1fa406jsne5cb618427ac'
 
 def clean_input(text: str) -> str:
@@ -81,13 +80,16 @@ async def check_single_username(client: httpx.AsyncClient, username: str) -> tup
         elif res.status_code == 404:
             return username, True
         return username, False
-    except Exception:
+    except Exception as e:
+        logging.error(f"Error checking {username}: {e}")
         return username, False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Received /start command")
     await update.message.reply_text('⚡ Send any word/username to check TikTok availability, or send /short to scan for available short handles!')
 
 async def short_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Received /short command")
     msg = await update.message.reply_text('🔍 Scanning for random available short handles...')
     candidates = generate_random_short_candidates(count=12)
     
@@ -110,6 +112,8 @@ async def short_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = clean_input(update.message.text)
+    logging.info(f"Received username query: {user_input}")
+    
     if len(user_input) < 2 or len(user_input) > 24:
         await update.message.reply_text('Username must be between 2 and 24 characters.')
         return
@@ -141,15 +145,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(reply_text, parse_mode='Markdown')
 
 def run_bot():
-    req = HTTPXRequest(connect_timeout=20.0, read_timeout=20.0)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    req = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
     
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('short', short_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print('Telegram Bot is starting...')
-    app.run_polling(timeout=30)
+    logging.info("Telegram Bot Polling Started...")
+    app.run_polling(drop_pending_updates=True, timeout=30)
 
-# Start Telegram bot in background thread when Gunicorn imports this module
+# Start bot thread execution
 Thread(target=run_bot, daemon=True).start()
