@@ -7,7 +7,7 @@ from telegram.request import HTTPXRequest
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# 1. Flask App Setup for Render Port Binding
+# 1. Flask App Setup for Render Health Checks
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -118,7 +118,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('Username must be between 2 and 24 characters.')
         return
     
-    msg = await update.message.reply_text(f'🔍 Scanning `@`{user_input} & short variations...')
+    msg = await update.message.reply_text(f'🔍 Scanning `@{user_input}` & short variations...')
     candidates = build_short_candidates(user_input)
     targets = [user_input] + candidates
     
@@ -158,9 +158,9 @@ def run_bot():
     app.run_polling(drop_pending_updates=True, timeout=30)
 
 if __name__ == '__main__':
-    # Start Telegram Bot in a background thread
+    # Start Telegram Bot in background thread
     Thread(target=run_bot, daemon=True).start()
     
-    # Run Flask directly bound to Render's dynamic PORT
+    # Bind Flask directly to Render's dynamic PORT
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
