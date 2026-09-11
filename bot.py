@@ -145,8 +145,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(reply_text, parse_mode='Markdown')
 
 def run_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    asyncio.set_event_loop(asyncio.new_event_loop())
     req = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
     
@@ -155,13 +154,11 @@ def run_bot():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     logging.info("Telegram Bot Polling Started...")
-    app.run_polling(drop_pending_updates=True, timeout=30)
+    app.run_polling(drop_pending_updates=True, timeout=30, stop_signals=None)
 
+# Start Telegram Bot thread immediately
 Thread(target=run_bot, daemon=True).start()
+
 if __name__ == '__main__':
-    # Start Telegram Bot in background thread
-    
-    
-    # Bind Flask directly to Render's dynamic PORT
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
