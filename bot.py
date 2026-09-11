@@ -22,7 +22,7 @@ RAPIDAPI_KEY = '345f1277afmsh8ecaec81b86c0e9p1fa406jsne5cb618427ac'
 def clean_input(text: str) -> str:
     return text.strip().lstrip('@').lower()
 
-def generate_random_short_candidates(count: int = 10) -> list[str]:
+def generate_random_short_candidates(count: int = 5) -> list[str]:
     chars = string.ascii_lowercase + string.digits
     candidates = set()
     patterns = [
@@ -60,7 +60,7 @@ def build_short_candidates(base_word: str) -> list[str]:
 
     valid_list = [c for c in candidates if 3 <= len(c) <= 24 and not c.endswith('.') and not c.startswith('.')]
     valid_list.sort(key=lambda x: (len(x), x))
-    return valid_list[:8]
+    return valid_list[:4]
 
 async def check_single_username(client: httpx.AsyncClient, username: str) -> tuple[str, bool]:
     if len(username) < 2:
@@ -73,16 +73,21 @@ async def check_single_username(client: httpx.AsyncClient, username: str) -> tup
     }
     try:
         res = await client.get(url, headers=headers)
+        logging.info(f"Checking @{username} -> Status Code: {res.status_code}")
+        
         if res.status_code == 200:
             data = res.json()
+            # TikTok API indicates available user if userInfo is empty or null
             if data.get('error') or data.get('userInfo') is None:
                 return username, True
             return username, False
         elif res.status_code == 404:
             return username, True
-        return username, False
+        else:
+            logging.warning(f"API Limit/Error {res.status_code} for @{username}")
+            return username, False
     except Exception as e:
-        logging.error(f"Error checking {username}: {e}")
+        logging.error(f"Error checking @{username}: {e}")
         return username, False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -91,19 +96,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def short_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info("Received /short command")
-    msg = await update.message.reply_text('🔍 Scanning for random available short handles...')
-    candidates = generate_random_short_candidates(count=12)
+    msg = await update.message.reply_text('🔍 Scanning for available short handles...')
+    candidates = generate_random_short_candidates(count=5)
     
+    available = []
     async with httpx.AsyncClient(timeout=10.0) as client:
-        tasks = [check_single_username(client, cand) for cand in candidates]
-        results = await asyncio.gather(*tasks)
+        for cand in candidates:
+            uname, is_free = await check_single_username(client, cand)
+            if is_free:
+                available.append(uname)
+            await asyncio.sleep(1.2) # Delay between requests to avoid rate limits
         
-    available = [uname for uname, is_free in results if is_free]
-    
     if available:
         available.sort(key=len)
         reply = '🔥 **Available Short Handles Found:**\n\n'
-        for idx, uname in enumerate(available[:5], 1):
+        for idx, uname in enumerate(available, 1):
             reply += f'{idx}. `@{uname}` ({len(uname)} chars)\n'
         reply += '\n_Send /short again to perform a new scan!_'
     else:
@@ -123,9 +130,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     candidates = build_short_candidates(user_input)
     targets = [user_input] + candidates
     
+    results = []
     async with httpx.AsyncClient(timeout=10.0) as client:
-        tasks = [check_single_username(client, target) for target in targets]
-        results = await asyncio.gather(*tasks)
+        for target in targets:
+            res = await check_single_username(client, target)
+            results.append(res)
+            await asyncio.sleep(1.2) # Delay between requests to avoid rate limits
     
     available_matches = [uname for uname, is_free in results if is_free]
     exact_free = user_input in available_matches
@@ -138,7 +148,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if available_matches:
         available_matches.sort(key=len)
         reply_text += '⚡ **Available Short Alternatives:**\n'
-        for idx, alt in enumerate(available_matches[:6], 1):
+        for idx, alt in enumerate(available_matches, 1):
             reply_text += f'{idx}. `@{alt}` ({len(alt)} chars)\n'
     else:
         reply_text += 'No available alternatives found in this batch.'
@@ -159,12 +169,10 @@ async def main():
     
     logging.info("Starting Flask health check server and Telegram bot concurrently...")
     
-    # Initialize and start bot application cleanly on main loop
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     
-    # Run Hypercorn serving Flask asynchronously alongside the bot updater
     await serve(flask_app, config)
 
 if __name__ == '__main__':
