@@ -157,9 +157,10 @@ def run_bot():
     logging.info("Telegram Bot Polling Started...")
     app.run_polling(drop_pending_updates=True, timeout=30)
 
+Thread(target=run_bot, daemon=True).start()
 if __name__ == '__main__':
     # Start Telegram Bot in background thread
-    Thread(target=run_bot, daemon=True).start()
+    
     
     # Bind Flask directly to Render's dynamic PORT
     port = int(os.environ.get("PORT", 10000))
