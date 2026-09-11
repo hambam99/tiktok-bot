@@ -1,9 +1,10 @@
 import logging, re, asyncio, httpx, random, string, os
 from flask import Flask
-from threading import Thread
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
+from hypercorn.config import Config
+from hypercorn.asyncio import serve
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -144,8 +145,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await msg.edit_text(reply_text, parse_mode='Markdown')
 
-def run_bot():
-    asyncio.set_event_loop(asyncio.new_event_loop())
+async def main():
     req = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
     
@@ -153,12 +153,19 @@ def run_bot():
     app.add_handler(CommandHandler('short', short_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    logging.info("Telegram Bot Polling Started...")
-    app.run_polling(drop_pending_updates=True, timeout=30, stop_signals=None)
-
-# Start Telegram Bot thread immediately
-Thread(target=run_bot, daemon=True).start()
+    config = Config()
+    port = int(os.environ.get("PORT", 10000))
+    config.bind = [f"0.0.0.0:{port}"]
+    
+    logging.info("Starting Flask health check server and Telegram bot concurrently...")
+    
+    # Initialize and start bot application cleanly on main loop
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    
+    # Run Hypercorn serving Flask asynchronously alongside the bot updater
+    await serve(flask_app, config)
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port)
+    asyncio.run(main())
