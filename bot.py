@@ -7,20 +7,20 @@ from telegram.request import HTTPXRequest
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Web server setup to keep Render's Free Web Service running
-flask_app = Flask('')
+# Web server setup to satisfy Render's HTTP health check
+flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def home():
-    return "Bot is running 24/7!"
+    return "Bot is live!", 200
 
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
     flask_app.run(host='0.0.0.0', port=port)
 
 # Credentials
 BOT_TOKEN = '8735644612:AAEhuQSjH0f9pxlUA5Lgl8Bv9fOxpB1Rh3k'
-RAPIDAPI_KEY = 'YOUR_RAPIDAPI_KEY'  # Replace with your actual RapidAPI Key
+RAPIDAPI_KEY = 'YOUR_RAPIDAPI_KEY'  # Ensure your valid RapidAPI Key is pasted here
 
 def clean_input(text: str) -> str:
     return text.strip().lstrip('@').lower()
@@ -144,10 +144,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(reply_text, parse_mode='Markdown')
 
 if __name__ == '__main__':
-    # Start web server thread
-    Thread(target=run_flask, daemon=True).start()
+    # Start web server thread for Render health check
+    server_thread = Thread(target=run_flask)
+    server_thread.daemon = True
+    server_thread.start()
     
-    # Start Telegram Bot
+    # Start Telegram bot
     req = HTTPXRequest(connect_timeout=20.0, read_timeout=20.0)
     app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
     
