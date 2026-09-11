@@ -1,13 +1,26 @@
-import logging, re, asyncio, httpx, random, string
+import logging, re, asyncio, httpx, random, string, os
+from flask import Flask
+from threading import Thread
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Replace with your actual credentials
+# Web server setup to keep Render's Free Web Service running
+flask_app = Flask('')
+
+@flask_app.route('/')
+def home():
+    return "Bot is running 24/7!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host='0.0.0.0', port=port)
+
+# Credentials
 BOT_TOKEN = '8735644612:AAEhuQSjH0f9pxlUA5Lgl8Bv9fOxpB1Rh3k'
-RAPIDAPI_KEY = 'YOUR_RAPIDAPI_KEY'  # Paste your valid RapidAPI Key here
+RAPIDAPI_KEY = 'YOUR_RAPIDAPI_KEY'  # Replace with your actual RapidAPI Key
 
 def clean_input(text: str) -> str:
     return text.strip().lstrip('@').lower()
@@ -75,7 +88,7 @@ async def check_single_username(client: httpx.AsyncClient, username: str) -> tup
         return username, False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('⚡ Send any word/username to check TikTok availability, or send /short to scan for available ultra-short handles!')
+    await update.message.reply_text('⚡ Send any word/username to check TikTok availability, or send /short to scan for available short handles!')
 
 async def short_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text('🔍 Scanning for random available short handles...')
@@ -104,7 +117,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('Username must be between 2 and 24 characters.')
         return
     
-    msg = await update.message.reply_text(f'🔍 Scanning `@`{user_input} & ultra-short variations...')
+    msg = await update.message.reply_text(f'🔍 Scanning `@`{user_input} & short variations...')
     candidates = build_short_candidates(user_input)
     targets = [user_input] + candidates
     
@@ -131,6 +144,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(reply_text, parse_mode='Markdown')
 
 if __name__ == '__main__':
+    # Start web server thread
+    Thread(target=run_flask, daemon=True).start()
+    
+    # Start Telegram Bot
     req = HTTPXRequest(connect_timeout=20.0, read_timeout=20.0)
     app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
     
@@ -138,5 +155,5 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('short', short_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print('Bot starting...')
+    print('Bot running 24/7...')
     app.run_polling(timeout=30)
