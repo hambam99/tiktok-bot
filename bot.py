@@ -114,7 +114,7 @@ def build_short_candidates(base_word: str) -> list[str]:
     valid_list.sort(key=lambda x: (len(x), x))
     return valid_list[:3]
 
-# 3. Handle Checker Logic for TikTok & Instagram
+# Handle Checker Engines
 async def check_tiktok(client: httpx.AsyncClient, username: str) -> tuple[str, bool]:
     if len(username) < 2:
         return username, False
@@ -154,16 +154,16 @@ async def check_instagram(client: httpx.AsyncClient, username: str) -> tuple[str
         logging.error(f"Instagram check error for @{username}: {e}")
         return username, False
 
-# 4. Background Drop Tracker
+# Background Tracker
 async def tracker_background_worker(app):
     while True:
         try:
-            await asyncio.sleep(900)  # Check every 15 minutes
+            await asyncio.sleep(900)
             targets = db_get_all_tracks()
             if not targets:
                 continue
                 
-            logging.info(f"Running background drop scan for {len(targets)} tracked handles...")
+            logging.info(f"Running drop scan for {len(targets)} tracked handles...")
             async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
                 for user_id, username, platform in targets:
                     if platform == 'tiktok':
@@ -186,12 +186,12 @@ async def tracker_background_worker(app):
         except Exception as e:
             logging.error(f"Tracker worker error: {e}")
 
-# Telegram Bot Handlers
+# Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "⚡ **Dual Handle Checker (TikTok + Instagram)**\n\n"
-        "• Send any username to check availability on both platforms.\n"
-        "• Send `/short` to scan for short available handles.\n"
+        "⚡ **Dual Handle & Variation Checker (TikTok + Instagram)**\n\n"
+        "• Send any word or handle to scan exact status + short variations on both platforms.\n"
+        "• Send `/short` to scan for available short handles.\n"
         "• Send `/track <platform> <username>` to monitor drops (e.g., `/track tiktok charli` or `/track ig charli`).\n"
         "• Send `/untrack <platform> <username>` to stop tracking.\n"
         "• Send `/list` to view your active monitors."
@@ -289,17 +289,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('Username must be between 2 and 24 characters.')
         return
     
-    msg = await update.message.reply_text(f'🔍 Scanning `@{user_input}` on TikTok & Instagram...')
+    msg = await update.message.reply_text(f'🔍 Scanning `@{user_input}` & variations on TikTok + Instagram...')
+    
+    variations = build_short_candidates(user_input)
+    all_targets = [user_input] + variations
+    
+    tt_available = []
+    ig_available = []
     
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-        _, tt_free = await check_tiktok(client, user_input)
-        await asyncio.sleep(1.0)
-        _, ig_free = await check_instagram(client, user_input)
+        for target in all_targets:
+            _, tt_free = await check_tiktok(client, target)
+            if tt_free:
+                tt_available.append(target)
+            await asyncio.sleep(1.0)
+            
+            _, ig_free = await check_instagram(client, target)
+            if ig_free:
+                ig_available.append(target)
+            await asyncio.sleep(1.0)
+            
+    exact_tt_free = user_input in tt_available
+    exact_ig_free = user_input in ig_available
     
-    reply_text = f"✨ **Results for `@{user_input}`:**\n\n"
-    reply_text += f"🎵 **TikTok:** {'**AVAILABLE**' if tt_free else 'TAKEN'}\n"
-    reply_text += f"📸 **Instagram:** {'**AVAILABLE**' if ig_free else 'TAKEN'}\n"
+    if exact_tt_free:
+        tt_available.remove(user_input)
+    if exact_ig_free:
+        ig_available.remove(user_input)
+
+    reply_text = f"✨ **Exact Match (`@{user_input}`):**\n"
+    reply_text += f"🎵 **TikTok:** {'**AVAILABLE**' if exact_tt_free else 'TAKEN'}\n"
+    reply_text += f"📸 **Instagram:** {'**AVAILABLE**' if exact_ig_free else 'TAKEN'}\n\n"
     
+    reply_text += "⚡ **Available TikTok Variations:**\n"
+    if tt_available:
+        for alt in tt_available:
+            reply_text += f"• `@{alt}`\n"
+    else:
+        reply_text += "No available variations found.\n"
+        
+    reply_text += "\n⚡ **Available Instagram Variations:**\n"
+    if ig_available:
+        for alt in ig_available:
+            reply_text += f"• `@{alt}`\n"
+    else:
+        reply_text += "No available variations found."
+
     await msg.edit_text(reply_text, parse_mode='Markdown')
 
 async def main():
@@ -317,7 +352,7 @@ async def main():
     port = int(os.environ.get("PORT", 10000))
     config.bind = [f"0.0.0.0:{port}"]
     
-    logging.info("Starting Web server, Telegram bot, and Dual-Platform Tracker...")
+    logging.info("Starting Web server, Telegram bot, and Dual-Platform Variation Engine...")
     
     await app.initialize()
     await app.start()
