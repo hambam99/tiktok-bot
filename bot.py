@@ -1,5 +1,5 @@
 import logging, re, asyncio, httpx, random, string, os
-from flask import Flask
+from quart import Quart
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
@@ -8,11 +8,11 @@ from hypercorn.asyncio import serve
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# 1. Flask App Setup for Render Health Checks
-flask_app = Flask(__name__)
+# 1. Native ASGI Quart App Setup for Render Health Checks
+quart_app = Quart(__name__)
 
-@flask_app.route('/')
-def home():
+@quart_app.route('/')
+async def home():
     return "Bot status: Active", 200
 
 # Credentials
@@ -77,7 +77,6 @@ async def check_single_username(client: httpx.AsyncClient, username: str) -> tup
         
         if res.status_code == 200:
             data = res.json()
-            # TikTok API indicates available user if userInfo is empty or null
             if data.get('error') or data.get('userInfo') is None:
                 return username, True
             return username, False
@@ -105,7 +104,7 @@ async def short_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uname, is_free = await check_single_username(client, cand)
             if is_free:
                 available.append(uname)
-            await asyncio.sleep(1.2) # Delay between requests to avoid rate limits
+            await asyncio.sleep(1.2)
         
     if available:
         available.sort(key=len)
@@ -135,7 +134,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for target in targets:
             res = await check_single_username(client, target)
             results.append(res)
-            await asyncio.sleep(1.2) # Delay between requests to avoid rate limits
+            await asyncio.sleep(1.2)
     
     available_matches = [uname for uname, is_free in results if is_free]
     exact_free = user_input in available_matches
@@ -167,13 +166,13 @@ async def main():
     port = int(os.environ.get("PORT", 10000))
     config.bind = [f"0.0.0.0:{port}"]
     
-    logging.info("Starting Flask health check server and Telegram bot concurrently...")
+    logging.info("Starting Quart health check server and Telegram bot concurrently...")
     
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     
-    await serve(flask_app, config)
+    await serve(quart_app, config)
 
 if __name__ == '__main__':
     asyncio.run(main())
