@@ -11,18 +11,21 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=lo
 # 1. ASGI Web Server for Health Check
 quart_app = Quart(__name__)
 
-# Global Auto-Scan Toggle & Settings
-AUTO_SCANNER_RUNNING = False
-AUTO_SCANNER_USER_ID = None  # Who receives the alerts
+# Global Platform Toggles & Alert Recipient
+TT_SCANNER_RUNNING = False
+IG_SCANNER_RUNNING = False
+AUTO_SCANNER_USER_ID = None  # Receives alerts
+
 AUTO_CLAIMER_WEBHOOK_URL = os.environ.get("CLAIMER_WEBHOOK", "")
 BOT_TOKEN = '8735644612:AAEhuQSjH0f9pxlUA5Lgl8Bv9fOxpB1Rh3k'
 
 @quart_app.route('/')
 async def home():
-    status = "Active (Scanning)" if AUTO_SCANNER_RUNNING else "Idle"
-    return f"Bot status: Autonomous 4L Sweeper [{status}]", 200
+    tt_status = "Active" if TT_SCANNER_RUNNING else "Idle"
+    ig_status = "Active" if IG_SCANNER_RUNNING else "Idle"
+    return f"Bot Status: TikTok Sweeper [{tt_status}] | Instagram Sweeper [{ig_status}]", 200
 
-# 2. Database for Discovered Available 4L Handles
+# 2. Database Setup
 def init_db():
     conn = sqlite3.connect('tracker.db')
     cursor = conn.cursor()
@@ -50,7 +53,7 @@ def save_found_handle(username: str, platform: str) -> bool:
     except sqlite3.IntegrityError:
         return False
 
-# 3. Random 4-Letter Handle Generators
+# 3. Handle Generator
 def generate_4l_candidate() -> str:
     """Generates clean 4-character combinations (CVCV, VCVC, pure alpha, or 3L+digit)"""
     vowels = 'aeiou'
@@ -99,7 +102,6 @@ async def check_instagram(client: httpx.AsyncClient, username: str) -> tuple[str
         return username, False
 
 async def trigger_auto_claim_webhook(username: str, platform: str):
-    """Fires immediate webhook payload to auto-claim script or external fast claimer"""
     if not AUTO_CLAIMER_WEBHOOK_URL:
         return
     async with httpx.AsyncClient(timeout=3.0) as client:
@@ -115,88 +117,111 @@ async def trigger_auto_claim_webhook(username: str, platform: str):
         except Exception as e:
             logging.error(f"Webhook execution failed: {e}")
 
-# 4. Continuous Autonomous Sweeper Worker
-async def autonomous_4l_sweeper(app):
-    global AUTO_SCANNER_RUNNING, AUTO_SCANNER_USER_ID
-    logging.info("Autonomous 4L Sweeper Worker initialized.")
+# 4. TikTok Dedicated Sweeper Worker
+async def tiktok_4l_sweeper(app):
+    global TT_SCANNER_RUNNING, AUTO_SCANNER_USER_ID
+    logging.info("TikTok Sweeper Worker initialized.")
     
     async with httpx.AsyncClient(timeout=6.0, follow_redirects=True) as client:
         while True:
-            if not AUTO_SCANNER_RUNNING or not AUTO_SCANNER_USER_ID:
-                await asyncio.sleep(3)
+            if not TT_SCANNER_RUNNING or not AUTO_SCANNER_USER_ID:
+                await asyncio.sleep(2)
                 continue
 
             try:
-                # Generate random candidate
                 cand = generate_4l_candidate()
-                
-                # Check TikTok
                 _, tt_free = await check_tiktok(client, cand)
+                
                 if tt_free and save_found_handle(cand, 'tiktok'):
                     await trigger_auto_claim_webhook(cand, 'tiktok')
                     claim_url = f"https://www.tiktok.com/@{cand}"
                     alert_text = (
-                        f"🚨 **AVAILABLE 4-LETTER FOUND!** 🚨\n\n"
+                        f"🎵 **AVAILABLE 4L FOUND (TIKTOK)**\n\n"
                         f"Handle: `@{cand}`\n"
                         f"Platform: **TIKTOK**\n\n"
                         f"⚡ [CLICK HERE TO CLAIM DIRECTLY]({claim_url})"
                     )
                     await app.bot.send_message(chat_id=AUTO_SCANNER_USER_ID, text=alert_text, parse_mode='Markdown')
 
-                await asyncio.sleep(0.8)  # Delay between platform checks to prevent IP block
+                await asyncio.sleep(0.8)  # TikTok scan delay
 
-                # Check Instagram
+            except Exception as e:
+                logging.error(f"TikTok sweeper error: {e}")
+                await asyncio.sleep(5)
+
+# 5. Instagram Dedicated Sweeper Worker
+async def instagram_4l_sweeper(app):
+    global IG_SCANNER_RUNNING, AUTO_SCANNER_USER_ID
+    logging.info("Instagram Sweeper Worker initialized.")
+    
+    async with httpx.AsyncClient(timeout=6.0, follow_redirects=True) as client:
+        while True:
+            if not IG_SCANNER_RUNNING or not AUTO_SCANNER_USER_ID:
+                await asyncio.sleep(2)
+                continue
+
+            try:
+                cand = generate_4l_candidate()
                 _, ig_free = await check_instagram(client, cand)
+                
                 if ig_free and save_found_handle(cand, 'instagram'):
                     await trigger_auto_claim_webhook(cand, 'instagram')
                     claim_url = f"https://www.instagram.com/{cand}"
                     alert_text = (
-                        f"🚨 **AVAILABLE 4-LETTER FOUND!** 🚨\n\n"
+                        f"📸 **AVAILABLE 4L FOUND (INSTAGRAM)**\n\n"
                         f"Handle: `@{cand}`\n"
                         f"Platform: **INSTAGRAM**\n\n"
                         f"⚡ [CLICK HERE TO CLAIM DIRECTLY]({claim_url})"
                     )
                     await app.bot.send_message(chat_id=AUTO_SCANNER_USER_ID, text=alert_text, parse_mode='Markdown')
 
-                await asyncio.sleep(1.2)  # Delay before generating next candidate
+                await asyncio.sleep(1.5)  # Instagram scan delay to reduce rate limiting
 
             except Exception as e:
-                logging.error(f"Sweeper loop error: {e}")
+                logging.error(f"Instagram sweeper error: {e}")
                 await asyncio.sleep(5)
 
 # Telegram Commands
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "⚡ **Autonomous 4-Letter Handle Sweeper & Sniper**\n\n"
-        "• `/autohunt start` — Turn on endless 24/7 background scanning for available 4L usernames.\n"
-        "• `/autohunt stop` — Pause the continuous scanner.\n"
-        "• `/found` — View all available 4L handles discovered so far.\n"
-        "• Send any single username to check availability instantly."
+        "⚡ **Autonomous 4-Letter Handle Sweeper**\n\n"
+        "• `/autohunt tt start` / `/autohunt tt stop` — Toggle TikTok continuous hunt\n"
+        "• `/autohunt ig start` / `/autohunt ig stop` — Toggle Instagram continuous hunt\n"
+        "• `/autohunt all start` / `/autohunt all stop` — Toggle both platforms\n"
+        "• `/found` — View all discovered 4L handles\n"
+        "• Send any handle to manually check availability"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def autohunt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global AUTO_SCANNER_RUNNING, AUTO_SCANNER_USER_ID
+    global TT_SCANNER_RUNNING, IG_SCANNER_RUNNING, AUTO_SCANNER_USER_ID
     
-    if not context.args or context.args[0].lower() not in ['start', 'stop']:
-        await update.message.reply_text("Usage: `/autohunt start` or `/autohunt stop`", parse_mode='Markdown')
-        return
-
-    action = context.args[0].lower()
-    user_id = update.effective_user.id
-
-    if action == 'start':
-        AUTO_SCANNER_RUNNING = True
-        AUTO_SCANNER_USER_ID = user_id
+    args = [a.lower() for a in context.args]
+    if len(args) < 2 or args[0] not in ['tt', 'ig', 'all'] or args[1] not in ['start', 'stop']:
         await update.message.reply_text(
-            "🔥 **AUTONOMOUS 4L HUNTING STARTED**\n\n"
-            "The bot is now generating and checking random 4-letter handles continuously in the background.\n"
-            "As soon as an uncreated/available handle is detected, you will get an instant alert!",
+            "Usage:\n"
+            "• `/autohunt tt start` / `/autohunt tt stop` (TikTok)\n"
+            "• `/autohunt ig start` / `/autohunt ig stop` (Instagram)\n"
+            "• `/autohunt all start` / `/autohunt all stop` (Both)",
             parse_mode='Markdown'
         )
-    else:
-        AUTO_SCANNER_RUNNING = False
-        await update.message.reply_text("🛑 **Autonomous hunt paused.**", parse_mode='Markdown')
+        return
+
+    target = args[0]
+    action = args[1]
+    AUTO_SCANNER_USER_ID = update.effective_user.id
+
+    if target in ['tt', 'all']:
+        TT_SCANNER_RUNNING = (action == 'start')
+    
+    if target in ['ig', 'all']:
+        IG_SCANNER_RUNNING = (action == 'start')
+
+    status_msg = "🔥 **AUTONOMOUS HUNT STATUS UPDATED**\n\n"
+    status_msg += f"🎵 **TikTok Scanner:** {'`RUNNING`' if TT_SCANNER_RUNNING else '`PAUSED`'}\n"
+    status_msg += f"📸 **Instagram Scanner:** {'`RUNNING`' if IG_SCANNER_RUNNING else '`PAUSED`'}"
+    
+    await update.message.reply_text(status_msg, parse_mode='Markdown')
 
 async def found_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect('tracker.db')
@@ -206,12 +231,13 @@ async def found_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if not rows:
-        await update.message.reply_text("No 4-letter handles discovered yet. Run `/autohunt start` to start hunting!", parse_mode='Markdown')
+        await update.message.reply_text("No 4-letter handles discovered yet.", parse_mode='Markdown')
         return
 
     reply = "📌 **Recently Discovered 4-Letter Handles:**\n\n"
     for uname, platform, found_at in rows:
-        reply += f"• `@{uname}` — **{platform.upper()}**\n"
+        icon = "🎵" if platform == 'tiktok' else "📸"
+        reply += f"{icon} `@{uname}` — **{platform.upper()}**\n"
     await update.message.reply_text(reply, parse_mode='Markdown')
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -245,14 +271,15 @@ async def main():
     port = int(os.environ.get("PORT", 10000))
     config.bind = [f"0.0.0.0:{port}"]
     
-    logging.info("Starting Autonomous 4L Sweeper...")
+    logging.info("Starting Separate Platform 4L Sweepers...")
     
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     
-    # Launch autonomous sweeper in background
-    asyncio.create_task(autonomous_4l_sweeper(app))
+    # Launch isolated background tasks for each platform
+    asyncio.create_task(tiktok_4l_sweeper(app))
+    asyncio.create_task(instagram_4l_sweeper(app))
     
     await serve(quart_app, config)
 
