@@ -90,29 +90,54 @@ def generate_random_short_candidates(count: int = 4) -> list[str]:
             candidates.add(cand)
     return list(candidates)
 
+# 3. Custom Leetspeak & Similarity Engine
 def build_short_candidates(base_word: str) -> list[str]:
     clean = re.sub(r'[^a-zA-Z0-9]', '', base_word).lower()
     candidates = set()
     
-    for char in 'vxyz179_':
-        candidates.add(f'{clean}{char}')
-        candidates.add(f'{char}{clean}')
-        
-    if len(clean) >= 3:
-        for i in range(1, len(clean)):
-            candidates.add(f'{clean[:i]}.{clean[i:]}')
-            
-    for p in ['i.', 'v.', 'x.', 'x_']:
-        candidates.add(f'{p}{clean}')
-        candidates.add(f'{clean}_{p[0]}')
-        
+    # Common Leetspeak Map (e.g. mosleh -> m0sleh, m0sle7, m0sl3h)
+    leet_map = {
+        'o': '0',
+        'e': '3',
+        'a': '4',
+        'i': '1',
+        's': '5',
+        't': '7',
+        'h': '7',
+        'z': '2'
+    }
+    
+    # 1. Single character leetspeak replacements
+    for i, char in enumerate(clean):
+        if char in leet_map:
+            subbed = clean[:i] + leet_map[char] + clean[i+1:]
+            candidates.add(subbed)
+
+    # 2. Multi-character combined leetspeak
+    full_leet = clean
+    for char, rep in leet_map.items():
+        full_leet = full_leet.replace(char, rep)
+    if full_leet != clean:
+        candidates.add(full_leet)
+
+    # 3. Vowels removal (mosleh -> mslh)
     no_vowels = re.sub(r'[aeiou]', '', clean)
     if len(no_vowels) >= 3 and no_vowels != clean:
         candidates.add(no_vowels)
 
+    # 4. Phonetic / Aesthetic vowel shifts (mosleh -> maslh, misleh)
+    for v in ['a', 'i', 'x']:
+        candidates.add(re.sub(r'[aeiou]', v, clean, count=1))
+
+    # 5. Clean minimalist prefixes & suffixes
+    for char in ['_', 'x', 'v', '1', '7']:
+        candidates.add(f"{clean}{char}")
+        candidates.add(f"{char}{clean}")
+
+    # Remove invalid handles
     valid_list = [c for c in candidates if 3 <= len(c) <= 24 and not c.endswith('.') and not c.startswith('.')]
     valid_list.sort(key=lambda x: (len(x), x))
-    return valid_list[:3]
+    return valid_list[:5]  # Returns top 5 variations
 
 # Handle Checker Engines
 async def check_tiktok(client: httpx.AsyncClient, username: str) -> tuple[str, bool]:
@@ -190,11 +215,11 @@ async def tracker_background_worker(app):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "⚡ **Dual Handle & Variation Checker (TikTok + Instagram)**\n\n"
-        "• Send any word or handle to scan exact status + short variations on both platforms.\n"
-        "• Send `/short` to scan for available short handles.\n"
-        "• Send `/track <platform> <username>` to monitor drops (e.g., `/track tiktok charli` or `/track ig charli`).\n"
+        "• Send any word (e.g. `mosleh`) to check exact status + Leetspeak/Short variations.\n"
+        "• Send `/short` to scan for short available handles.\n"
+        "• Send `/track <platform> <username>` to monitor drops.\n"
         "• Send `/untrack <platform> <username>` to stop tracking.\n"
-        "• Send `/list` to view your active monitors."
+        "• Send `/list` to view active monitors."
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -289,7 +314,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('Username must be between 2 and 24 characters.')
         return
     
-    msg = await update.message.reply_text(f'🔍 Scanning `@{user_input}` & variations on TikTok + Instagram...')
+    msg = await update.message.reply_text(f'🔍 Scanning `@{user_input}` & similar variations on TikTok + Instagram...')
     
     variations = build_short_candidates(user_input)
     all_targets = [user_input] + variations
@@ -321,19 +346,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_text += f"🎵 **TikTok:** {'**AVAILABLE**' if exact_tt_free else 'TAKEN'}\n"
     reply_text += f"📸 **Instagram:** {'**AVAILABLE**' if exact_ig_free else 'TAKEN'}\n\n"
     
-    reply_text += "⚡ **Available TikTok Variations:**\n"
+    reply_text += "⚡ **Available Similar TikTok Handles:**\n"
     if tt_available:
         for alt in tt_available:
             reply_text += f"• `@{alt}`\n"
     else:
-        reply_text += "No available variations found.\n"
+        reply_text += "No variations available in this batch.\n"
         
-    reply_text += "\n⚡ **Available Instagram Variations:**\n"
+    reply_text += "\n⚡ **Available Similar Instagram Handles:**\n"
     if ig_available:
         for alt in ig_available:
             reply_text += f"• `@{alt}`\n"
     else:
-        reply_text += "No available variations found."
+        reply_text += "No variations available in this batch."
 
     await msg.edit_text(reply_text, parse_mode='Markdown')
 
@@ -352,7 +377,7 @@ async def main():
     port = int(os.environ.get("PORT", 10000))
     config.bind = [f"0.0.0.0:{port}"]
     
-    logging.info("Starting Web server, Telegram bot, and Dual-Platform Variation Engine...")
+    logging.info("Starting Web server, Telegram bot, and Leetspeak Variation Engine...")
     
     await app.initialize()
     await app.start()
