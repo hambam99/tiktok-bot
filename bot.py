@@ -8,21 +8,20 @@ from hypercorn.asyncio import serve
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# 1. Native ASGI Quart App Setup for Render Health Checks
+# 1. ASGI Web Server for Render Health Check
 quart_app = Quart(__name__)
 
 @quart_app.route('/')
 async def home():
     return "Bot status: Active", 200
 
-# Credentials
+# Telegram Bot Token
 BOT_TOKEN = '8735644612:AAEhuQSjH0f9pxlUA5Lgl8Bv9fOxpB1Rh3k'
-RAPIDAPI_KEY = '345f1277afmsh8ecaec81b86c0e9p1fa406jsne5cb618427ac'
 
 def clean_input(text: str) -> str:
     return text.strip().lstrip('@').lower()
 
-def generate_random_short_candidates(count: int = 5) -> list[str]:
+def generate_random_short_candidates(count: int = 4) -> list[str]:
     chars = string.ascii_lowercase + string.digits
     candidates = set()
     patterns = [
@@ -60,30 +59,35 @@ def build_short_candidates(base_word: str) -> list[str]:
 
     valid_list = [c for c in candidates if 3 <= len(c) <= 24 and not c.endswith('.') and not c.startswith('.')]
     valid_list.sort(key=lambda x: (len(x), x))
-    return valid_list[:4]
+    return valid_list[:3]  # Keep batch tiny to avoid web blocks
 
 async def check_single_username(client: httpx.AsyncClient, username: str) -> tuple[str, bool]:
     if len(username) < 2:
         return username, False
     
-    url = f'https://tiktok-all-in-one.p.rapidapi.com/user/info?username={username}'
+    url = f'https://www.tiktok.com/api/user/detail/?uniqueId={username}'
     headers = {
-        'X-RapidAPI-Key': RAPIDAPI_KEY,
-        'X-RapidAPI-Host': 'tiktok-all-in-one.p.rapidapi.com'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.tiktok.com/'
     }
     try:
         res = await client.get(url, headers=headers)
-        logging.info(f"Checking @{username} -> Status Code: {res.status_code}")
+        logging.info(f"Checking @{username} -> TikTok Web Code: {res.status_code}")
         
         if res.status_code == 200:
             data = res.json()
-            if data.get('error') or data.get('userInfo') is None:
-                return username, True
-            return username, False
+            # If user object exists and has user info, handle is TAKEN
+            userInfo = data.get('userInfo', {})
+            if userInfo and 'user' in userInfo:
+                return username, False
+            # Otherwise (user not found code or empty userInfo), AVAILABLE
+            return username, True
         elif res.status_code == 404:
             return username, True
         else:
-            logging.warning(f"API Limit/Error {res.status_code} for @{username}")
+            logging.warning(f"Unexpected status {res.status_code} for @{username}")
             return username, False
     except Exception as e:
         logging.error(f"Error checking @{username}: {e}")
@@ -96,15 +100,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def short_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info("Received /short command")
     msg = await update.message.reply_text('🔍 Scanning for available short handles...')
-    candidates = generate_random_short_candidates(count=5)
+    candidates = generate_random_short_candidates(count=4)
     
     available = []
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         for cand in candidates:
             uname, is_free = await check_single_username(client, cand)
             if is_free:
                 available.append(uname)
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.5)  # Throttling delay
         
     if available:
         available.sort(key=len)
@@ -130,11 +134,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     targets = [user_input] + candidates
     
     results = []
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         for target in targets:
             res = await check_single_username(client, target)
             results.append(res)
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.5)  # Throttling delay
     
     available_matches = [uname for uname, is_free in results if is_free]
     exact_free = user_input in available_matches
@@ -166,7 +170,7 @@ async def main():
     port = int(os.environ.get("PORT", 10000))
     config.bind = [f"0.0.0.0:{port}"]
     
-    logging.info("Starting Quart health check server and Telegram bot concurrently...")
+    logging.info("Starting Web server and Telegram bot concurrently...")
     
     await app.initialize()
     await app.start()
