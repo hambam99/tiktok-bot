@@ -1,4 +1,4 @@
-python-telegram-bot
-httpx
-quart
-hypercorn
+python-telegram-bot>=20.0
+httpx>=0.24.0
+quart>=0.19.0
+hypercorn>=0.14.0
