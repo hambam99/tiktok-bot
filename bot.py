@@ -56,7 +56,6 @@ class BotConfig:
     PORT: int = int(os.environ.get("PORT", 10000))
     RENDER_EXTERNAL_URL: str = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
     
-    # Comma-separated list of proxies for rotation (e.g., "http://user:pass@ip:port,http://ip2:port2")
     PROXIES: List[str] = [p.strip() for p in os.environ.get("PROXY_LIST", "").split(",") if p.strip()]
     DEFAULT_PROXY: Optional[str] = os.environ.get("PROXY_URL", None)
     
@@ -87,7 +86,7 @@ USER_AGENTS = [
 
 GLOBAL_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 IN_MEMORY_WATCHLIST: Dict[int, List[Tuple[str, str]]] = {}
-IN_MEMORY_AUTOHUNT_USERS: Dict[int, str] = {}
+IN_MEMORY_AUTOHUNT_USERS: Dict[Tuple[int, str], str] = {}
 IN_MEMORY_SCANNED_HANDLES: Set[str] = set()
 IN_MEMORY_USER_CREDENTIALS: Dict[int, Dict[str, Any]] = {}
 
@@ -132,7 +131,7 @@ def generate_pattern_handle(pattern: str = "4char") -> str:
         return "".join(random.choices(chars, k=4))
 
 # ==============================================================================
-# 3. STATE-TRACKED DATABASE ENGINE
+# 3. STATE-TRACKED DATABASE ENGINE (SEPARATED AUTO-HUNT SCHEMA)
 # ==============================================================================
 
 async def init_db():
@@ -154,9 +153,11 @@ async def init_db():
             """)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS autohunt_users (
-                    user_id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    platform TEXT NOT NULL,
                     pattern TEXT NOT NULL,
-                    enabled_at REAL NOT NULL
+                    enabled_at REAL NOT NULL,
+                    PRIMARY KEY (user_id, platform)
                 )
             """)
             await db.execute("""
@@ -173,7 +174,7 @@ async def init_db():
                 )
             """)
             await db.commit()
-        logger.info("Database with state tracking and credential storage initialized.")
+        logger.info("Database with state tracking and separate platform auto-hunt initialized.")
     except Exception as e:
         logger.error(f"Database setup error: {e}")
 
@@ -300,40 +301,46 @@ async def get_all_watchlist_items() -> List[Tuple[int, str, str]]:
             all_items.append((uid, plat, uname))
     return all_items
 
-async def toggle_autohunt_db(user_id: int, pattern: str = "4char") -> Tuple[bool, str]:
+async def toggle_autohunt_db(user_id: int, platform: str, pattern: str = "4char") -> Tuple[bool, str, str]:
+    plat = "instagram" if platform in ("ig", "instagram") else "tiktok"
     if HAS_AIOSQLITE:
         try:
             async with aiosqlite.connect(BotConfig.DB_FILE, timeout=10.0) as db:
-                cursor = await db.execute("SELECT pattern FROM autohunt_users WHERE user_id = ?", (user_id,))
+                cursor = await db.execute("SELECT pattern FROM autohunt_users WHERE user_id = ? AND platform = ?", (user_id, plat))
                 row = await cursor.fetchone()
                 if row:
-                    await db.execute("DELETE FROM autohunt_users WHERE user_id = ?", (user_id,))
+                    await db.execute("DELETE FROM autohunt_users WHERE user_id = ? AND platform = ?", (user_id, plat))
                     await db.commit()
-                    return False, pattern
+                    return False, plat, pattern
                 else:
-                    await db.execute("INSERT INTO autohunt_users (user_id, pattern, enabled_at) VALUES (?, ?, ?)", (user_id, pattern, time.time()))
+                    await db.execute(
+                        "INSERT INTO autohunt_users (user_id, platform, pattern, enabled_at) VALUES (?, ?, ?, ?)",
+                        (user_id, plat, pattern, time.time())
+                    )
                     await db.commit()
-                    return True, pattern
+                    return True, plat, pattern
         except Exception as e:
             logger.error(f"Auto-hunt DB error: {e}")
-            return False, pattern
+            return False, plat, pattern
     else:
-        if user_id in IN_MEMORY_AUTOHUNT_USERS:
-            del IN_MEMORY_AUTOHUNT_USERS[user_id]
-            return False, pattern
+        key = (user_id, plat)
+        if key in IN_MEMORY_AUTOHUNT_USERS:
+            del IN_MEMORY_AUTOHUNT_USERS[key]
+            return False, plat, pattern
         else:
-            IN_MEMORY_AUTOHUNT_USERS[user_id] = pattern
-            return True, pattern
+            IN_MEMORY_AUTOHUNT_USERS[key] = pattern
+            return True, plat, pattern
 
-async def get_autohunt_users() -> List[Tuple[int, str]]:
+async def get_autohunt_users() -> List[Tuple[int, str, str]]:
     if HAS_AIOSQLITE:
         try:
             async with aiosqlite.connect(BotConfig.DB_FILE, timeout=10.0) as db:
-                cursor = await db.execute("SELECT user_id, pattern FROM autohunt_users")
+                cursor = await db.execute("SELECT user_id, platform, pattern FROM autohunt_users")
                 return await cursor.fetchall()
         except Exception:
             return []
-    return list(IN_MEMORY_AUTOHUNT_USERS.items())
+    
+    return [(uid_plat[0], uid_plat[1], pat) for uid_plat, pat in IN_MEMORY_AUTOHUNT_USERS.items()]
 
 # ==============================================================================
 # 4. RATE LIMITING & CACHE
@@ -381,7 +388,6 @@ cache_mgr = CacheManager(ttl_seconds=300)
 # ==============================================================================
 
 async def attempt_autoclaim_instagram(username: str, session_id: str) -> Tuple[bool, str]:
-    """Executes an instant claim request for an available Instagram handle."""
     clean = sanitize_username(username)
     url = "https://www.instagram.com/api/v1/web/accounts/edit/"
     headers = {
@@ -616,31 +622,39 @@ async def handle_sniper_task(telegram_app):
 
 async def handle_autohunt_task(telegram_app):
     await asyncio.sleep(20)
-    logger.info("Auto-Hunt background engine initialized.")
+    logger.info("Platform-Isolated Auto-Hunt engine initialized.")
 
     while True:
         try:
             hunters = await get_autohunt_users()
             if hunters:
-                for user_id, pattern in hunters:
+                for user_id, platform, pattern in hunters:
                     candidate = generate_pattern_handle(pattern)
                     attempts = 0
                     while await is_handle_scanned(candidate) and attempts < 10:
                         candidate = generate_pattern_handle(pattern)
                         attempts += 1
 
-                    results = await scan_single_handle(candidate)
-                    ig_avail = results["instagram"][0] == "AVAILABLE"
-                    tt_avail = results["tiktok"][0] == "AVAILABLE"
+                    is_available = False
+                    status_desc = ""
 
-                    if ig_avail or tt_avail:
+                    if platform == "instagram":
+                        status, status_desc = await check_instagram_username(candidate)
+                        is_available = (status == "AVAILABLE")
+                    elif platform == "tiktok":
+                        status, status_desc = await check_tiktok_username(candidate)
+                        is_available = (status == "AVAILABLE")
+
+                    await mark_handle_scanned(candidate)
+
+                    if is_available:
                         alert_msg = (
-                            f"🎯 <b>AUTO-HUNT FIND!</b> 🎯\n\n"
-                            f"Pattern (<code>{pattern}</code>) handle <code>@{html.escape(candidate)}</code> is <b>AVAILABLE</b>!\n"
+                            f"🎯 <b>AUTO-HUNT FIND ({platform.upper()})!</b> 🎯\n\n"
+                            f"Handle <code>@{html.escape(candidate)}</code> (Pattern: <code>{pattern}</code>) is <b>AVAILABLE</b> on <b>{platform.capitalize()}</b>!\n"
                         )
-                        
+
                         creds = await get_user_credentials(user_id)
-                        if ig_avail and creds and creds.get("auto_claim") and creds.get("ig_session"):
+                        if platform == "instagram" and creds and creds.get("auto_claim") and creds.get("ig_session"):
                             claimed, claim_msg = await attempt_autoclaim_instagram(candidate, creds["ig_session"])
                             alert_msg += f"\n⚡ <b>Auto-Claim Result:</b> {claim_msg}"
 
@@ -652,11 +666,11 @@ async def handle_autohunt_task(telegram_app):
                                 reply_markup=build_scan_keyboard(candidate)
                             )
                         except Forbidden:
-                            await toggle_autohunt_db(user_id)
+                            await toggle_autohunt_db(user_id, platform, pattern)
                         except Exception as err:
-                            logger.error(f"Auto-hunt error for {user_id}: {err}")
+                            logger.error(f"Auto-hunt alert error for {user_id}: {err}")
 
-                await asyncio.sleep(random.uniform(5.0, 10.0))
+                await asyncio.sleep(random.uniform(4.0, 8.0))
             else:
                 await asyncio.sleep(15)
         except Exception as e:
@@ -718,7 +732,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/scan &lt;username&gt;</code> — Instant availability check\n"
         "• <code>/batch &lt;u1, u2&gt;</code> — Scan up to 10 handles\n"
         "• <code>/generate &lt;pattern&gt;</code> — Generate rare handles (3char, 4char, cvcv, abba)\n"
-        "• <code>/autohunt &lt;pattern&gt;</code> — Toggle auto-hunting (e.g., <code>/autohunt cvcv</code>)\n"
+        "• <code>/autohunt &lt;ig|tt&gt; [pattern]</code> — Toggle auto-hunting (e.g., <code>/autohunt ig cvcv</code>)\n"
         "• <code>/autoclaim &lt;session_id&gt;</code> — Enable instant IG turbo auto-claiming\n"
         "• <code>/watch &lt;ig|tt&gt; &lt;user&gt;</code> — Set sniper target\n"
         "• <code>/watchlist</code> — View monitored targets\n"
@@ -758,20 +772,31 @@ async def autohunt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    pattern = context.args[0].lower() if context.args else "4char"
+    if not context.args:
+        await safe_reply(update, "❌ Usage: <code>/autohunt &lt;ig|tt&gt; [pattern]</code>\nExample: <code>/autohunt ig cvcv</code>")
+        return
+
+    platform_input = context.args[0].lower()
+    if platform_input not in ("ig", "instagram", "tt", "tiktok"):
+        await safe_reply(update, "❌ Invalid platform. Use <code>ig</code> or <code>tt</code>.\nExample: <code>/autohunt ig 4char</code>")
+        return
+
+    pattern = context.args[1].lower() if len(context.args) > 1 else "4char"
     if pattern not in ("3char", "4char", "cvcv", "abba"):
         pattern = "4char"
 
-    is_active, active_pat = await toggle_autohunt_db(user_id, pattern)
+    is_active, active_plat, active_pat = await toggle_autohunt_db(user_id, platform_input, pattern)
 
     if is_active:
         msg = (
-            f"🎯 <b>Auto Hunt Activated!</b>\n\n"
-            f"Pattern: <code>{active_pat}</code>\n"
-            f"The bot is scanning un-checked <code>{active_pat}</code> handles across proxy networks."
+            f"🎯 <b>Auto-Hunt Activated!</b>\n\n"
+            f"• <b>Platform:</b> {active_plat.capitalize()}\n"
+            f"• <b>Pattern:</b> <code>{active_pat}</code>\n"
+            f"The bot is scanning un-checked <code>{active_pat}</code> handles exclusively on <b>{active_plat.capitalize()}</b>."
         )
     else:
-        msg = "🛑 <b>Auto Hunt Deactivated.</b>"
+        msg = f"🛑 <b>Auto-Hunt Deactivated for {active_plat.capitalize()}.</b>"
+        
     await safe_reply(update, msg)
 
 async def autoclaim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -950,7 +975,7 @@ async def setup_bot_commands(telegram_app):
         BotCommand("scan", "Check IG & TikTok handle availability"),
         BotCommand("batch", "Scan up to 10 handles simultaneously"),
         BotCommand("generate", "Auto-generate & scan rare handles"),
-        BotCommand("autohunt", "Toggle auto-hunting (4char, cvcv, abba)"),
+        BotCommand("autohunt", "Toggle platform auto-hunting (ig/tt)"),
         BotCommand("autoclaim", "Enable turbo auto-claiming via IG session"),
         BotCommand("watch", "Snipe handle: alert when available"),
         BotCommand("watchlist", "View all monitored target handles"),
