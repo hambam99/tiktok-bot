@@ -2,29 +2,32 @@ import os
 import sys
 import logging
 import asyncio
-import httpx
 import random
-import string
 import time
-import gc
-from typing import Optional, Dict, Tuple
-from quart import Quart
+import re
+import json
+import string
+from typing import Optional, Tuple, Dict, Any, List
+
+import aiosqlite
+import httpx
+from quart import Quart, request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
-    filters,
+    filters
 )
 from telegram.request import HTTPXRequest
 from hypercorn.config import Config as HyperConfig
 from hypercorn.asyncio import serve
 
 # ==============================================================================
-# 1. LOGGING & CONFIGURATION
+# 1. CONFIGURATION & LOGGING
 # ==============================================================================
 
 logging.basicConfig(
@@ -32,481 +35,596 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO
 )
-logger = logging.getLogger("InteractiveScannerBot")
+logger = logging.getLogger("UltraScannerBot")
 
 class BotConfig:
     """Central configuration management."""
     BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
     PORT: int = int(os.environ.get("PORT", 10000))
-    HTTP_TIMEOUT: float = 15.0
+    RENDER_EXTERNAL_URL: str = os.environ.get("RENDER_EXTERNAL_URL", "")
     
-    IG_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "X-IG-App-ID": "936619743392459",
-    }
+    # Optional Rotating Residential Proxy: e.g. "http://user:pass@proxy.com:8080"
+    PROXY_URL: Optional[str] = os.environ.get("PROXY_URL", None)
     
-    TT_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
+    # Session Cookies for authenticated requests to bypass strict block limits
+    IG_SESSION_ID: Optional[str] = os.environ.get("IG_SESSION_ID", None)
+    TT_SESSION_ID: Optional[str] = os.environ.get("TT_SESSION_ID", None)
+
+    # Webhook mode enablement
+    USE_WEBHOOK: bool = os.environ.get("USE_WEBHOOK", "false").lower() == "true"
+    
+    # Anti-Spam Rate Limiter: Max 8 requests per 10 seconds per user
+    RATE_LIMIT_COUNT: int = 8
+    RATE_LIMIT_WINDOW: float = 10.0
+    MAX_BATCH_SIZE: int = 10
+    DB_FILE: str = "scanner_studio.db"
 
 if not BotConfig.BOT_TOKEN:
     logger.critical("FATAL: 'BOT_TOKEN' environment variable is missing!")
     sys.exit(1)
 
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+]
+
+GLOBAL_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+
 # ==============================================================================
-# 2. WEB SERVER FOR HEALTH CHECKS (QUART)
+# 2. DATABASE ENGINE (AIOSQLITE)
+# ==============================================================================
+
+async def init_db():
+    """Initializes persistent SQLite database for target monitoring."""
+    async with aiosqlite.connect(BotConfig.DB_FILE) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS watchlist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                username TEXT NOT NULL,
+                added_at REAL NOT NULL,
+                UNIQUE(user_id, platform, username)
+            )
+        """)
+        await db.commit()
+    logger.info("Database schema verified.")
+
+async def add_to_watchlist(user_id: int, platform: str, username: str) -> bool:
+    try:
+        async with aiosqlite.connect(BotConfig.DB_FILE) as db:
+            await db.execute(
+                "INSERT INTO watchlist (user_id, platform, username, added_at) VALUES (?, ?, ?, ?)",
+                (user_id, platform.lower(), username.lower(), time.time())
+            )
+            await db.commit()
+            return True
+    except Exception:
+        return False
+
+async def remove_from_watchlist(user_id: int, platform: str, username: str) -> bool:
+    async with aiosqlite.connect(BotConfig.DB_FILE) as db:
+        cursor = await db.execute(
+            "DELETE FROM watchlist WHERE user_id = ? AND platform = ? AND username = ?",
+            (user_id, platform.lower(), username.lower())
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+async def get_user_watchlist(user_id: int) -> List[Tuple[str, str]]:
+    async with aiosqlite.connect(BotConfig.DB_FILE) as db:
+        cursor = await db.execute(
+            "SELECT platform, username FROM watchlist WHERE user_id = ?",
+            (user_id,)
+        )
+        return await cursor.fetchall()
+
+# ==============================================================================
+# 3. RATE LIMITER & IN-MEMORY CACHE
+# ==============================================================================
+
+class SecurityRateLimiter:
+    """Sliding-window rate limiter preventing IP exhaustion."""
+    def __init__(self, max_requests: int, window_seconds: float):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.user_history: Dict[int, List[float]] = {}
+
+    def is_allowed(self, user_id: int) -> bool:
+        now = time.time()
+        timestamps = self.user_history.get(user_id, [])
+        valid_timestamps = [t for t in timestamps if now - t < self.window_seconds]
+        
+        if len(valid_timestamps) >= self.max_requests:
+            return False
+            
+        valid_timestamps.append(now)
+        self.user_history[user_id] = valid_timestamps
+        return True
+
+class CacheManager:
+    """TTL cache to eliminate repetitive network checks."""
+    def __init__(self, ttl_seconds: float = 300):
+        self.cache: Dict[str, Tuple[Tuple[str, str], float]] = {}
+        self.ttl = ttl_seconds
+
+    def get(self, key: str) -> Optional[Tuple[str, str]]:
+        if key in self.cache:
+            data, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                return data
+            del self.cache[key]
+        return None
+
+    def set(self, key: str, value: Tuple[str, str]):
+        self.cache[key] = (value, time.time())
+
+rate_limiter = SecurityRateLimiter(BotConfig.RATE_LIMIT_COUNT, BotConfig.RATE_LIMIT_WINDOW)
+cache_mgr = CacheManager(ttl_seconds=300)
+
+# ==============================================================================
+# 4. MULTI-ENDPOINT INSTAGRAM & TIKTOK ENGINES
+# ==============================================================================
+
+async def check_instagram_username(username: str) -> Tuple[str, str]:
+    clean_user = username.lstrip("@").strip().lower()
+    cached = cache_mgr.get(f"ig:{clean_user}")
+    if cached:
+        return cached
+
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-IG-App-ID": "936619743392459",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://www.instagram.com/{clean_user}/",
+    }
+    if BotConfig.IG_SESSION_ID:
+        headers["Cookie"] = f"sessionid={BotConfig.IG_SESSION_ID};"
+
+    # --- Primary Endpoint: Web Profile Info API ---
+    try:
+        url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={clean_user}"
+        res = await GLOBAL_HTTP_CLIENT.get(url, headers=headers)
+        if res.status_code == 404:
+            result = ("AVAILABLE", "Handle is completely free.")
+            cache_mgr.set(f"ig:{clean_user}", result)
+            return result
+        elif res.status_code == 200:
+            data = res.json()
+            user = data.get("data", {}).get("user")
+            if user is None:
+                result = ("AVAILABLE", "Handle is free/unassigned.")
+            else:
+                full_name = user.get('full_name', clean_user)
+                result = ("TAKEN", f"Registered to: {full_name}")
+            cache_mgr.set(f"ig:{clean_user}", result)
+            return result
+    except Exception:
+        pass
+
+    # --- Secondary Fallback Endpoint: Search API ---
+    try:
+        fallback_url = f"https://www.instagram.com/web/search/topsearch/?query={clean_user}"
+        res = await GLOBAL_HTTP_CLIENT.get(fallback_url, headers=headers)
+        if res.status_code == 200:
+            users = res.json().get("users", [])
+            exact_match = any(u.get("user", {}).get("username", "").lower() == clean_user for u in users)
+            result = ("TAKEN", "Account active (Search Fallback).") if exact_match else ("AVAILABLE", "Handle unlisted in search.")
+            cache_mgr.set(f"ig:{clean_user}", result)
+            return result
+    except Exception:
+        pass
+
+    result = ("BLOCKED", "Rate limited across endpoints.")
+    cache_mgr.set(f"ig:{clean_user}", result)
+    return result
+
+async def check_tiktok_username(username: str) -> Tuple[str, str]:
+    clean_user = username.lstrip("@").strip().lower()
+    cached = cache_mgr.get(f"tt:{clean_user}")
+    if cached:
+        return cached
+
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if BotConfig.TT_SESSION_ID:
+        headers["Cookie"] = f"sessionid_ss={BotConfig.TT_SESSION_ID};"
+
+    # --- Primary Endpoint: Profile HTML Script Parsing ---
+    try:
+        url = f"https://www.tiktok.com/@{clean_user}"
+        res = await GLOBAL_HTTP_CLIENT.get(url, headers=headers, follow_redirects=True)
+        if res.status_code == 404:
+            result = ("AVAILABLE", "Profile page returned 404.")
+            cache_mgr.set(f"tt:{clean_user}", result)
+            return result
+        elif res.status_code == 200:
+            match = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', res.text, re.DOTALL)
+            if match:
+                payload = json.loads(match.group(1))
+                user_detail = payload.get("__DEFAULT_SCOPE__", {}).get("webapp.user-detail", {})
+                status_code = user_detail.get("statusCode")
+                if status_code in (10221, 10202, 404):
+                    result = ("AVAILABLE", "User ID unassigned.")
+                else:
+                    result = ("TAKEN", "Account is active.")
+                cache_mgr.set(f"tt:{clean_user}", result)
+                return result
+    except Exception:
+        pass
+
+    # --- Secondary Fallback Endpoint: User Detail API ---
+    try:
+        api_url = f"https://www.tiktok.com/api/user/detail/?uniqueId={clean_user}"
+        res = await GLOBAL_HTTP_CLIENT.get(api_url, headers=headers)
+        if res.status_code == 200:
+            user_info = res.json().get("userInfo")
+            result = ("TAKEN", "Profile confirmed (API Fallback).") if user_info else ("AVAILABLE", "User not found (API Fallback).")
+            cache_mgr.set(f"tt:{clean_user}", result)
+            return result
+    except Exception:
+        pass
+
+    result = ("BLOCKED", "Rate limited across endpoints.")
+    cache_mgr.set(f"tt:{clean_user}", result)
+    return result
+
+async def scan_single_handle(username: str) -> Dict[str, Tuple[str, str]]:
+    ig_task = check_instagram_username(username)
+    tt_task = check_tiktok_username(username)
+    ig_res, tt_res = await asyncio.gather(ig_task, tt_task)
+    return {"instagram": ig_res, "tiktok": tt_res}
+
+# ==============================================================================
+# 5. QUART SERVER, WEBHOOKS & BACKGROUND WORKERS
 # ==============================================================================
 
 quart_app = Quart(__name__)
 BOT_START_TIME = time.time()
+TELEGRAM_APP_REF = None  # Global reference for Telegram Webhook handler
 
 @quart_app.route("/")
 async def health_check():
     uptime = int(time.time() - BOT_START_TIME)
-    return (
-        f"🤖 Interactive Username Scanner Bot Operational\n"
-        f"⏱️ Uptime: {uptime}s\n"
-        f"📊 Status: Running",
-        200
-    )
+    return f"🤖 Production Scanner Active | Uptime: {uptime}s", 200
 
 @quart_app.route("/ping")
 async def ping():
     return "PONG", 200
 
-# ==============================================================================
-# 3. GLOBAL SCANNER & USER STATE MANAGERS
-# ==============================================================================
+@quart_app.route("/webhook", methods=["POST"])
+async def telegram_webhook():
+    """Ultra-fast Webhook route replacing continuous polling."""
+    if TELEGRAM_APP_REF and request.headers.get("content-type") == "application/json":
+        data = await request.get_json()
+        update = Update.de_json(data, TELEGRAM_APP_REF.bot)
+        await TELEGRAM_APP_REF.process_update(update)
+        return Response("ok", status=200)
+    return Response("error", status=400)
 
-class ScannerState:
-    is_scanning: bool = False
-    scanner_task: Optional[asyncio.Task] = None
-    scanned_count: int = 0
-    available_found: int = 0
-    active_platform: str = "ig"
-    active_length: int = 4
-    current_target_chat: Optional[int] = None
+async def keep_alive_task():
+    """Background worker keeping Render instances awake nonstop."""
+    await asyncio.sleep(10)
+    target_url = BotConfig.RENDER_EXTERNAL_URL.rstrip('/') + "/ping" if BotConfig.RENDER_EXTERNAL_URL else f"http://127.0.0.1:{BotConfig.PORT}/ping"
+    
+    while True:
+        try:
+            if GLOBAL_HTTP_CLIENT:
+                await GLOBAL_HTTP_CLIENT.get(target_url, timeout=10.0)
+        except Exception as e:
+            logger.debug(f"Keep-alive ping error: {e}")
+        await asyncio.sleep(240)
 
-state = ScannerState()
+async def handle_sniper_task(telegram_app):
+    """Monitors watched handles in the background and alerts users when available."""
+    await asyncio.sleep(15)
+    logger.info("Target Sniper service activated.")
+    while True:
+        try:
+            async with aiosqlite.connect(BotConfig.DB_FILE) as db:
+                cursor = await db.execute("SELECT user_id, platform, username FROM watchlist")
+                rows = await cursor.fetchall()
 
-# Track user state when waiting for specific text input: { chat_id: "ig" | "tt" }
-user_input_wait: Dict[int, str] = {}
+            for user_id, platform, username in rows:
+                if platform == "instagram":
+                    status, _ = await check_instagram_username(username)
+                else:
+                    status, _ = await check_tiktok_username(username)
 
-# ==============================================================================
-# 4. INSTAGRAM & TIKTOK CHECKER ENGINE
-# ==============================================================================
-
-async def check_instagram_username(client: httpx.AsyncClient, username: str) -> Tuple[str, str]:
-    clean_username = username.strip().lstrip("@").lower()
-    
-    if len(clean_username) < 3 or len(clean_username) > 30:
-        return "INVALID", "Instagram usernames must be between 3 and 30 characters."
-    
-    url = f"https://www.instagram.com/{clean_username}/"
-    
-    try:
-        response = await client.get(url, headers=BotConfig.IG_HEADERS)
-        if response.status_code == 404:
-            return "AVAILABLE", clean_username
-        elif response.status_code == 200:
-            return "TAKEN", clean_username
-        elif response.status_code in (429, 302, 403):
-            logger.warning("Instagram rate limit hit. Auto-pausing silently for 15 minutes...")
-            await asyncio.sleep(900)
-            return "RATE_LIMITED", clean_username
-        else:
-            return "ERROR", f"HTTP Status {response.status_code}"
-    except httpx.RequestError as e:
-        logger.error(f"Network error checking IG '{clean_username}': {e}")
-        return "ERROR", str(e)
-
-async def check_tiktok_username(client: httpx.AsyncClient, username: str) -> Tuple[str, str]:
-    clean_username = username.strip().lstrip("@").lower()
-    
-    if len(clean_username) < 2 or len(clean_username) > 24:
-        return "INVALID", "TikTok usernames must be between 2 and 24 characters."
-    
-    url = f"https://www.tiktok.com/@{clean_username}"
-    
-    try:
-        response = await client.get(url, headers=BotConfig.TT_HEADERS)
-        if response.status_code == 404:
-            return "AVAILABLE", clean_username
-        elif response.status_code == 200:
-            return "TAKEN", clean_username
-        elif response.status_code in (403, 429):
-            logger.warning("TikTok rate limit hit. Auto-pausing silently for 15 minutes...")
-            await asyncio.sleep(900)
-            return "RATE_LIMITED", clean_username
-        else:
-            return "ERROR", f"HTTP Status {response.status_code}"
-    except httpx.RequestError as e:
-        logger.error(f"Network error checking TikTok '{clean_username}': {e}")
-        return "ERROR", str(e)
-
-async def check_username(client: httpx.AsyncClient, platform: str, username: str) -> Tuple[str, str]:
-    if platform == "tt":
-        return await check_tiktok_username(client, username)
-    return await check_instagram_username(client, username)
-
-def generate_random_username(platform: str = "ig", length: int = 5) -> str:
-    min_len = 2 if platform == "tt" else 3
-    max_len = 24 if platform == "tt" else 30
-    length = max(min_len, min(max_len, length))
-    
-    chars = string.ascii_lowercase + string.digits + "._"
-    start_char = random.choice(string.ascii_lowercase)
-    
-    if length == 2:
-        end_char = random.choice(string.ascii_lowercase + string.digits)
-        return f"{start_char}{end_char}"
-    
-    middle_chars = [random.choice(chars) for _ in range(length - 2)]
-    end_char = random.choice(string.ascii_lowercase + string.digits)
-    return f"{start_char}{''.join(middle_chars)}{end_char}"
+                if status == "AVAILABLE":
+                    alert_msg = (
+                        f"🚨 **TARGET SNIPED & AVAILABLE!** 🚨\n\n"
+                        f"The handle `@{username}` is now **AVAILABLE** on **{platform.capitalize()}**!\n"
+                        f"Claim it immediately!"
+                    )
+                    try:
+                        await telegram_app.bot.send_message(chat_id=user_id, text=alert_msg, parse_mode=ParseMode.MARKDOWN)
+                        await remove_from_watchlist(user_id, platform, username)
+                    except Exception as err:
+                        logger.error(f"Failed to send alert to {user_id}: {err}")
+                await asyncio.sleep(2)
+        except Exception as e:
+            logger.error(f"Sniper background worker error: {e}")
+        await asyncio.sleep(900)  # Scan target list every 15 minutes
 
 # ==============================================================================
-# 5. KEYBOARD MENU BUILDERS
+# 6. COMMAND HANDLERS & PATTERN GENERATOR
 # ==============================================================================
 
-def build_main_menu_keyboard() -> InlineKeyboardMarkup:
-    buttons = [
+def get_status_icon(status: str) -> str:
+    return "🟢 AVAILABLE" if status == "AVAILABLE" else ("🔴 TAKEN" if status == "TAKEN" else "⚠️ RATE LIMITED")
+
+def build_scan_keyboard(username: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📸 Instagram Scanner", callback_data="menu_platform_ig"),
-            InlineKeyboardButton("🎵 TikTok Scanner", callback_data="menu_platform_tt")
-        ],
-        [
-            InlineKeyboardButton("📊 System Status", callback_data="action_status"),
-            InlineKeyboardButton("🛑 Stop Auto-Scanner", callback_data="action_stop")
+            InlineKeyboardButton("🔄 Re-Scan", callback_data=f"rescan:{username}"),
+            InlineKeyboardButton("🎯 Watch IG", callback_data=f"watch:instagram:{username}"),
+            InlineKeyboardButton("🎯 Watch TT", callback_data=f"watch:tiktok:{username}")
         ]
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-def build_platform_keyboard(platform: str) -> InlineKeyboardMarkup:
-    platform_name = "TikTok" if platform == "tt" else "Instagram"
-    buttons = [
-        [
-            InlineKeyboardButton(f"✍️ Check Specific Handle", callback_data=f"input_req_{platform}")
-        ],
-        [
-            InlineKeyboardButton("🚀 Auto-Hunt (3-Char)", callback_data=f"auto_start_{platform}_3"),
-            InlineKeyboardButton("🚀 Auto-Hunt (4-Char)", callback_data=f"auto_start_{platform}_4"),
-        ],
-        [
-            InlineKeyboardButton("🚀 Auto-Hunt (5-Char)", callback_data=f"auto_start_{platform}_5"),
-        ],
-        [
-            InlineKeyboardButton("🔙 Back to Main Menu", callback_data="menu_main")
-        ]
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-def build_after_check_keyboard(platform: str) -> InlineKeyboardMarkup:
-    buttons = [
-        [
-            InlineKeyboardButton("✍️ Check Another Username", callback_data=f"input_req_{platform}"),
-            InlineKeyboardButton("🔙 Platform Menu", callback_data=f"menu_platform_{platform}")
-        ],
-        [
-            InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")
-        ]
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-# ==============================================================================
-# 6. TELEGRAM CALLBACK & HANDLER ENGINE
-# ==============================================================================
+    ])
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends the interactive main menu."""
-    chat_id = update.effective_chat.id
-    if chat_id in user_input_wait:
-        del user_input_wait[chat_id]
-        
-    menu_text = (
-        "🤖 **Username Scanner Control Panel**\n\n"
-        "Tap an option below to scan handles or configure auto-hunting:"
+    welcome_text = (
+        "🚀 **Ultra Scanner & Target Sniper Studio**\n\n"
+        "⚡ **Commands:**\n"
+        "• `/scan <username>` — Check IG & TikTok availability\n"
+        "• `/batch <user1, user2>` — Scan up to 10 handles simultaneously\n"
+        "• `/generate <3char|4char>` — Auto-generate & scan rare handles\n"
+        "• `/watch <ig|tt> <user>` — Target sniper: get alerted when a handle drops\n"
+        "• `/watchlist` — View all actively monitored target handles\n"
+        "• `/unwatch <ig|tt> <user>` — Stop monitoring a target handle\n\n"
+        "💡 *Or simply send any username directly in chat!*"
     )
-    if update.message:
-        await update.message.reply_text(menu_text, reply_markup=build_main_menu_keyboard(), parse_mode=ParseMode.MARKDOWN)
-    elif update.callback_query:
-        await update.callback_query.edit_message_text(menu_text, reply_markup=build_main_menu_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
 
-async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes all inline button clicks."""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    chat_id = update.effective_chat.id
-
-    # 1. Main Menu
-    if data == "menu_main":
-        if chat_id in user_input_wait:
-            del user_input_wait[chat_id]
-        await query.edit_message_text(
-            "🤖 **Username Scanner Control Panel**\n\nTap an option below to proceed:",
-            reply_markup=build_main_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    # 2. Select Platform Submenu
-    elif data.startswith("menu_platform_"):
-        platform = data.split("_")[2]
-        platform_name = "TikTok" if platform == "tt" else "Instagram"
-        if chat_id in user_input_wait:
-            del user_input_wait[chat_id]
-        
-        await query.edit_message_text(
-            f"📱 **{platform_name} Scanner Options**\n\n"
-            f"Select what you would like to do for **{platform_name}**:",
-            reply_markup=build_platform_keyboard(platform),
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    # 3. Request Manual Username Input
-    elif data.startswith("input_req_"):
-        platform = data.split("_")[2]
-        platform_name = "TikTok" if platform == "tt" else "Instagram"
-        user_input_wait[chat_id] = platform
-        
-        await query.edit_message_text(
-            f"✍️ **Type the {platform_name} username you want to check:**\n\n"
-            f"*(Just send the handle in chat below)*",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    # 4. Start Background Auto-Scanner
-    elif data.startswith("auto_start_"):
-        _, _, platform, length_str = data.split("_")
-        length = int(length_str)
-        platform_name = "TikTok" if platform == "tt" else "Instagram"
-
-        if state.is_scanning:
-            await query.edit_message_text(
-                f"⚠️ **Scanner is already active!**\n"
-                f"Currently scanning on `{state.active_platform.upper()}`.\n\n"
-                f"Stop the current scanner first before starting a new one.",
-                reply_markup=build_main_menu_keyboard(),
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-
-        state.is_scanning = True
-        state.active_platform = platform
-        state.active_length = length
-        state.current_target_chat = chat_id
-
-        state.scanner_task = asyncio.create_task(
-            background_scanner_loop(context, platform, length, chat_id)
-        )
-
-        await query.edit_message_text(
-            f"🚀 **Auto-Scanner Launched!**\n\n"
-            f"📱 **Platform:** `{platform_name}`\n"
-            f"📏 **Length:** `{length}` characters\n"
-            f"🤫 **Silent Mode:** Active (No rate-limit alerts will be sent).\n\n"
-            f"You will receive a Telegram message immediately when a free handle is found!",
-            reply_markup=build_main_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    # 5. Stop Scanner
-    elif data == "action_stop":
-        if not state.is_scanning:
-            await query.edit_message_text(
-                "ℹ️ **No background scanner is currently active.**",
-                reply_markup=build_main_menu_keyboard(),
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-
-        state.is_scanning = False
-        if state.scanner_task:
-            state.scanner_task.cancel()
-            state.scanner_task = None
-
-        await query.edit_message_text(
-            "🛑 **Auto-scanner stopped successfully.**",
-            reply_markup=build_main_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    # 6. System Status
-    elif data == "action_status":
-        uptime = int(time.time() - BOT_START_TIME)
-        platform_name = "TikTok" if state.active_platform == "tt" else "Instagram"
-        scanning_status = f"🟢 Scanning {platform_name} ({state.active_length}-Char)" if state.is_scanning else "🔴 Idle"
-
-        status_text = (
-            "📊 **Live Scanner Status & Metrics**\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚙️ **State:** `{scanning_status}`\n"
-            f"⏱️ **Uptime:** `{uptime}s`\n"
-            f"🔍 **Total Checked:** `{state.scanned_count}`\n"
-            f"✨ **Available Found:** `{state.available_found}`\n"
-            f"🤫 **Rate Limit Mode:** `Silent Auto-Pause`"
-        )
-        await query.edit_message_text(status_text, reply_markup=build_main_menu_keyboard(), parse_mode=ParseMode.MARKDOWN)
-
-async def handle_user_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Captures and checks usernames sent as text when requested."""
-    chat_id = update.effective_chat.id
-
-    # If the user wasn't prompted to type a handle, point them to the interactive menu
-    if chat_id not in user_input_wait:
-        await update.message.reply_text(
-            "💡 Tap a button below to interact with the scanner:",
-            reply_markup=build_main_menu_keyboard()
-        )
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not rate_limiter.is_allowed(update.effective_user.id):
+        await update.message.reply_text("⏳ **Rate Limit Exceeded.** Please wait 10 seconds.")
         return
 
-    platform = user_input_wait[chat_id]
-    target_username = update.message.text.strip().lstrip("@")
-    platform_name = "TikTok" if platform == "tt" else "Instagram"
+    raw_user = context.args[0] if context.args else ""
+    if not raw_user:
+        await update.message.reply_text("❌ **Specify a username!**\nExample: `/scan luxury`", parse_mode=ParseMode.MARKDOWN)
+        return
 
-    # Reset input wait state
-    del user_input_wait[chat_id]
+    clean_user = raw_user.lstrip("@").strip()
+    status_msg = await update.message.reply_text(f"🔍 *Scanning `@{clean_user}`...*", parse_mode=ParseMode.MARKDOWN)
+    results = await scan_single_handle(clean_user)
 
-    status_msg = await update.message.reply_text(f"🔍 Checking {platform_name} `@{target_username}`...", parse_mode=ParseMode.MARKDOWN)
+    ig_status, ig_info = results["instagram"]
+    tt_status, tt_info = results["tiktok"]
 
-    async with httpx.AsyncClient(timeout=BotConfig.HTTP_TIMEOUT, follow_redirects=True) as client:
-        status, result = await check_username(client, platform, target_username)
+    response = (
+        f"📊 **Scan Results for `@${clean_user}`**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📸 **Instagram:** {get_status_icon(ig_status)}\n"
+        f"└ _{ig_info}_\n\n"
+        f"🎵 **TikTok:** {get_status_icon(tt_status)}\n"
+        f"└ _{tt_info}_"
+    )
+    await status_msg.edit_text(response, parse_mode=ParseMode.MARKDOWN, reply_markup=build_scan_keyboard(clean_user))
 
-    state.scanned_count += 1
+async def batch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not rate_limiter.is_allowed(update.effective_user.id):
+        await update.message.reply_text("⏳ **Rate Limit Exceeded.**")
+        return
 
-    if status == "AVAILABLE":
-        state.available_found += 1
-        link = f"https://tiktok.com/@{result}" if platform == "tt" else f"https://instagram.com/{result}"
-        claim_msg = (
-            f"🎉 **AVAILABLE {platform_name.upper()} HANDLE FOUND!**\n\n"
-            f"👉 **Handle:** `@{result}`\n"
-            f"🔗 **Direct Link:** {link}\n\n"
-            f"📌 **How to Claim:**\n"
-            f"1. Open {platform_name} App.\n"
-            f"2. Go to **Edit Profile** -> **Username**.\n"
-            f"3. Type `@{result}` and tap **Save** immediately."
-        )
-        await status_msg.edit_text(claim_msg, reply_markup=build_after_check_keyboard(platform), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+    if not context.args:
+        await update.message.reply_text("❌ Specify usernames separated by commas! Example: `/batch user1, user2`")
+        return
 
-    elif status == "TAKEN":
-        await status_msg.edit_text(
-            f"❌ {platform_name} handle `@{result}` is **TAKEN**.",
-            reply_markup=build_after_check_keyboard(platform),
-            parse_mode=ParseMode.MARKDOWN
-        )
+    raw_input = " ".join(context.args)
+    handles = [h.strip().lstrip("@") for h in re.split(r'[, \n]+', raw_input) if h.strip()][:BotConfig.MAX_BATCH_SIZE]
+    status_msg = await update.message.reply_text(f"⚡ *Batch Scanning {len(handles)} handles...*", parse_mode=ParseMode.MARKDOWN)
 
-    elif status == "RATE_LIMITED":
-        await status_msg.edit_text(
-            f"⚠️ {platform_name} server busy. Please try again in a few moments.",
-            reply_markup=build_after_check_keyboard(platform),
-            parse_mode=ParseMode.MARKDOWN
-        )
+    semaphore = asyncio.Semaphore(3)
+    async def worker(h):
+        async with semaphore:
+            res = await scan_single_handle(h)
+            await asyncio.sleep(0.3)
+            return h, res
 
+    results = await asyncio.gather(*[worker(h) for h in handles])
+    report = [f"📋 **Batch Scan Report ({len(handles)} handles)**\n━━━━━━━━━━━━━━━━━━━"]
+    for handle, res in results:
+        ig_st = "🟢" if res["instagram"][0] == "AVAILABLE" else ("🔴" if res["instagram"][0] == "TAKEN" else "⚠️")
+        tt_st = "🟢" if res["tiktok"][0] == "AVAILABLE" else ("🔴" if res["tiktok"][0] == "TAKEN" else "⚠️")
+        report.append(f"`@{handle}` $\rightarrow$ IG: {ig_st} | TT: {tt_st}")
+
+    await status_msg.edit_text("\n".join(report), parse_mode=ParseMode.MARKDOWN)
+
+async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto-generates pattern handles (e.g., 3-char, 4-char) and batch scans them."""
+    if not rate_limiter.is_allowed(update.effective_user.id):
+        await update.message.reply_text("⏳ **Rate Limit Exceeded.**")
+        return
+
+    gen_type = context.args[0].lower() if context.args else "4char"
+    length = 3 if gen_type == "3char" else 4
+
+    # Generate 5 random candidate handles
+    candidates = []
+    chars = string.ascii_lowercase + string.digits + "_"
+    for _ in range(5):
+        candidates.append("".join(random.choices(chars, k=length)))
+
+    status_msg = await update.message.reply_text(f"🎲 *Generating & scanning 5 rare `{length}-character` handles...*", parse_mode=ParseMode.MARKDOWN)
+
+    report = [f"🎲 **Pattern Generator (`{length}-char`)**\n━━━━━━━━━━━━━━━━━━━"]
+    for handle in candidates:
+        res = await scan_single_handle(handle)
+        ig_st = "🟢" if res["instagram"][0] == "AVAILABLE" else ("🔴" if res["instagram"][0] == "TAKEN" else "⚠️")
+        tt_st = "🟢" if res["tiktok"][0] == "AVAILABLE" else ("🔴" if res["tiktok"][0] == "TAKEN" else "⚠️")
+        report.append(f"`@{handle}` $\rightarrow$ IG: {ig_st} | TT: {tt_st}")
+
+    await status_msg.edit_text("\n".join(report), parse_mode=ParseMode.MARKDOWN)
+
+async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Adds a handle to the sniper watchlist."""
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Usage: `/watch <ig|tt> <username>`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    platform = "instagram" if context.args[0].lower() in ("ig", "instagram") else "tiktok"
+    username = context.args[1].lstrip("@").strip()
+
+    success = await add_to_watchlist(update.effective_user.id, platform, username)
+    if success:
+        await update.message.reply_text(f"🎯 **Target Locked!** Monitoring `@{username}` on **{platform.capitalize()}**. You will receive an instant message when it drops!", parse_mode=ParseMode.MARKDOWN)
     else:
-        await status_msg.edit_text(
-            f"⚠️ Could not verify `@{target_username}` ({result}).",
-            reply_markup=build_after_check_keyboard(platform),
-            parse_mode=ParseMode.MARKDOWN
+        await update.message.reply_text(f"⚠️ `@{username}` is already in your watchlist.")
+
+async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Usage: `/unwatch <ig|tt> <username>`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    platform = "instagram" if context.args[0].lower() in ("ig", "instagram") else "tiktok"
+    username = context.args[1].lstrip("@").strip()
+
+    removed = await remove_from_watchlist(update.effective_user.id, platform, username)
+    if removed:
+        await update.message.reply_text(f"🗑️ Removed `@{username}` ({platform}) from your watchlist.", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text("❌ Target handle not found in your watchlist.")
+
+async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    items = await get_user_watchlist(update.effective_user.id)
+    if not items:
+        await update.message.reply_text("📋 Your watchlist is empty. Add targets with `/watch <ig|tt> <username>`.")
+        return
+
+    lines = ["📋 **Your Active Sniper Watchlist**\n━━━━━━━━━━━━━━━━━━━"]
+    for platform, username in items:
+        lines.append(f"• **{platform.capitalize()}:** `@{username}`")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def handle_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text.startswith("/") or " " in text or len(text) > 30:
+        return
+
+    if not rate_limiter.is_allowed(update.effective_user.id):
+        await update.message.reply_text("⏳ Wait a few seconds before scanning again.")
+        return
+
+    clean_user = text.lstrip("@").strip()
+    status_msg = await update.message.reply_text(f"🔍 *Scanning `@{clean_user}`...*", parse_mode=ParseMode.MARKDOWN)
+    results = await scan_single_handle(clean_user)
+
+    response = (
+        f"📊 **Scan Results for `@${clean_user}`**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📸 **Instagram:** {get_status_icon(results['instagram'][0])}\n"
+        f"└ _{results['instagram'][1]}_\n\n"
+        f"🎵 **TikTok:** {get_status_icon(results['tiktok'][0])}\n"
+        f"└ _{results['tiktok'][1]}_"
+    )
+    await status_msg.edit_text(response, parse_mode=ParseMode.MARKDOWN, reply_markup=build_scan_keyboard(clean_user))
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data.startswith("rescan:"):
+        username = data.split(":")[1]
+        results = await scan_single_handle(username)
+        response = (
+            f"📊 **Scan Results for `@${username}`** *(Refreshed)*\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📸 **Instagram:** {get_status_icon(results['instagram'][0])}\n"
+            f"└ _{results['instagram'][1]}_\n\n"
+            f"🎵 **TikTok:** {get_status_icon(results['tiktok'][0])}\n"
+            f"└ _{results['tiktok'][1]}_"
         )
+        await query.edit_message_text(response, parse_mode=ParseMode.MARKDOWN, reply_markup=build_scan_keyboard(username))
+    elif data.startswith("watch:"):
+        _, platform, username = data.split(":")
+        success = await add_to_watchlist(query.from_user.id, platform, username)
+        if success:
+            await query.message.reply_text(f"🎯 **Target Locked!** Added `@{username}` ({platform}) to your watchlist.")
+        else:
+            await query.message.reply_text(f"⚠️ `@{username}` is already in your watchlist.")
 
 # ==============================================================================
-# 7. BACKGROUND AUTOMATIC SCANNER LOOP
+# 7. MAIN APPLICATION BOOTSTRAPPER
 # ==============================================================================
-
-async def background_scanner_loop(context: ContextTypes.DEFAULT_TYPE, platform: str, target_length: int, chat_id: int):
-    platform_label = "TikTok" if platform == "tt" else "Instagram"
-    logger.info(f"Starting auto-scanner loop for {platform_label} (length {target_length})...")
-    
-    async with httpx.AsyncClient(timeout=BotConfig.HTTP_TIMEOUT, follow_redirects=True) as client:
-        while state.is_scanning:
-            target_username = generate_random_username(platform, target_length)
-            status, result = await check_username(client, platform, target_username)
-            state.scanned_count += 1
-
-            if status == "AVAILABLE":
-                state.available_found += 1
-                link = f"https://tiktok.com/@{result}" if platform == "tt" else f"https://instagram.com/{result}"
-                alert_text = (
-                    f"🎯 **AUTOMATIC SCANNER MATCH ({platform_label.upper()})!**\n\n"
-                    f"✨ **Handle:** `@{result}`\n"
-                    f"🔗 **Link:** {link}\n\n"
-                    f"📌 **Claim Steps:** Open {platform_label} -> Edit Profile -> Change Username to `@{result}`."
-                )
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=alert_text,
-                        reply_markup=build_after_check_keyboard(platform),
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to deliver Telegram alert: {e}")
-
-            gc.collect()
-            await asyncio.sleep(2.0)
-
-# ==============================================================================
-# 8. ERROR HANDLER & MAIN ENTRYPOINT
-# ==============================================================================
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Uncaught exception encountered during execution:", exc_info=context.error)
 
 async def main():
-    request_kwargs = HTTPXRequest(
-        connect_timeout=20.0,
-        read_timeout=BotConfig.HTTP_TIMEOUT,
-        write_timeout=BotConfig.HTTP_TIMEOUT,
-        pool_timeout=20.0
-    )
+    global GLOBAL_HTTP_CLIENT, TELEGRAM_APP_REF
+    logger.info("Initializing Commercial Scanner Runtime...")
 
-    telegram_app = (
-        ApplicationBuilder()
-        .token(BotConfig.BOT_TOKEN)
-        .request(request_kwargs)
-        .build()
-    )
+    await init_db()
 
-    # Handlers
+    # Configure HTTPX AsyncClient with Proxy if present
+    client_kwargs = {
+        "limits": httpx.Limits(max_keepalive_connections=50, max_connections=200),
+        "timeout": httpx.Timeout(20.0, connect=10.0),
+        "follow_redirects": True,
+        "http2": True
+    }
+    if BotConfig.PROXY_URL:
+        client_kwargs["proxy"] = BotConfig.PROXY_URL
+        logger.info("Residential Proxy Tunnel Configured.")
+
+    GLOBAL_HTTP_CLIENT = httpx.AsyncClient(**client_kwargs)
+
+    request_kwargs = HTTPXRequest(connect_timeout=15.0, read_timeout=20.0)
+    telegram_app = ApplicationBuilder().token(BotConfig.BOT_TOKEN).request(request_kwargs).build()
+    TELEGRAM_APP_REF = telegram_app
+
+    # Command Handlers
     telegram_app.add_handler(CommandHandler("start", start_command))
-    telegram_app.add_handler(CommandHandler("menu", start_command))
-    telegram_app.add_handler(CallbackQueryHandler(button_callback_handler))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_text_input))
-    
-    telegram_app.add_error_handler(error_handler)
+    telegram_app.add_handler(CommandHandler("help", start_command))
+    telegram_app.add_handler(CommandHandler("scan", scan_command))
+    telegram_app.add_handler(CommandHandler("batch", batch_command))
+    telegram_app.add_handler(CommandHandler("generate", generate_command))
+    telegram_app.add_handler(CommandHandler("watch", watch_command))
+    telegram_app.add_handler(CommandHandler("unwatch", unwatch_command))
+    telegram_app.add_handler(CommandHandler("watchlist", watchlist_command))
+    telegram_app.add_handler(CallbackQueryHandler(callback_handler))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direct_text))
 
-    # Initialize Telegram Bot
     await telegram_app.initialize()
     await telegram_app.start()
-    
-    await telegram_app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-    logger.info("Telegram Polling active & listening for scanner commands!")
 
-    # Configure Web Server for Render / Cloud hosting
-    hypercorn_config = HyperConfig()
-    hypercorn_config.bind = [f"0.0.0.0:{BotConfig.PORT}"]
-    hypercorn_config.shutdown_timeout = 5.0
+    # Webhook or Polling Dispatch
+    if BotConfig.USE_WEBHOOK and BotConfig.RENDER_EXTERNAL_URL:
+        webhook_url = f"{BotConfig.RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
+        await telegram_app.bot.set_webhook(url=webhook_url)
+        logger.info(f"Webhook registered at: {webhook_url}")
+    else:
+        await telegram_app.updater.start_polling(drop_pending_updates=True)
+        logger.info("Polling mode active.")
 
-    logger.info(f"Binding Quart web server to port {BotConfig.PORT}...")
+    # Background Tasks
+    asyncio.create_task(keep_alive_task())
+    asyncio.create_task(handle_sniper_task(telegram_app))
+
+    hyper_config = HyperConfig()
+    hyper_config.bind = [f"0.0.0.0:{BotConfig.PORT}"]
 
     try:
-        await serve(quart_app, hypercorn_config)
+        await serve(quart_app, hyper_config)
     finally:
-        logger.info("Initiating graceful shutdown sequence...")
-        state.is_scanning = False
-        if state.scanner_task:
-            state.scanner_task.cancel()
-        await telegram_app.updater.stop()
+        logger.info("Shutting down engine cleanly...")
+        if telegram_app.updater and telegram_app.updater.running:
+            await telegram_app.updater.stop()
         await telegram_app.stop()
         await telegram_app.shutdown()
-        logger.info("Shutdown complete.")
+        if GLOBAL_HTTP_CLIENT:
+            await GLOBAL_HTTP_CLIENT.aclose()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot execution terminated by system signal.")
+        logger.info("Execution stopped.")
